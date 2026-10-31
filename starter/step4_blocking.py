@@ -24,7 +24,9 @@ heavy_compute. Она синхронная и работает 1-3 секунд�
   для to_thread и для пула процессов. Почему оно отличается? Вспомните GIL.
 """
 
+import argparse
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 
 from timer import log, print_time
 
@@ -45,17 +47,87 @@ def heavy_compute() -> int:
     return h
 
 
-async def handle_request(client: str, duration: float) -> None:
+async def handle_request(
+    client: str,
+    duration: float,
+    *,
+    mode: str,
+    heavy_clients: set[str],
+    pool: ProcessPoolExecutor | None = None,
+) -> None:
     log(f"{client}: запрос принят")
-    await asyncio.sleep(duration)
+
+    if client not in heavy_clients:
+        await asyncio.sleep(duration)
+    elif mode == "blocked":
+        heavy_compute()
+    elif mode == "thread":
+        await asyncio.to_thread(heavy_compute)
+    elif mode == "process":
+        if pool is None:
+            raise ValueError("Для режима process нужен ProcessPoolExecutor")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(pool, heavy_compute)
+    else:
+        raise ValueError(f"Неизвестный режим: {mode}")
+
     log(f"{client}: ответ отправлен")
 
 
-async def main() -> None:
-    coroutines = [handle_request(client, duration) for client, duration in CLIENTS]
-    await asyncio.gather(*coroutines)
+async def serve(
+    mode: str,
+    heavy_clients: set[str],
+    pool: ProcessPoolExecutor | None = None,
+) -> None:
+    await asyncio.gather(
+        *(
+            handle_request(
+                client,
+                duration,
+                mode=mode,
+                heavy_clients=heavy_clients,
+                pool=pool,
+            )
+            for client, duration in CLIENTS
+        )
+    )
+
+
+async def main(
+    mode: str = "blocked",
+    heavy_clients: set[str] | None = None,
+) -> None:
+    selected_heavy_clients = {"bob"} if heavy_clients is None else heavy_clients
+
+    if mode == "process":
+        with ProcessPoolExecutor() as pool:
+            await serve(mode, selected_heavy_clients, pool)
+    else:
+        await serve(mode, selected_heavy_clients)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Показать блокировку event loop и способы вынести вычисления."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("blocked", "thread", "process"),
+        default="blocked",
+        help="blocked — считать в event loop; thread/process — вынести вычисления",
+    )
+    parser.add_argument(
+        "--heavy",
+        default="bob",
+        help="список клиентов с тяжёлыми вычислениями через запятую (по умолчанию: bob)",
+    )
+    args = parser.parse_args()
+
+    known_clients = {client for client, _ in CLIENTS}
+    heavy_clients = {name.strip() for name in args.heavy.split(",") if name.strip()}
+    unknown_clients = heavy_clients - known_clients
+    if unknown_clients:
+        parser.error(f"неизвестные клиенты: {', '.join(sorted(unknown_clients))}")
+
     with print_time():
-        asyncio.run(main())
+        asyncio.run(main(mode=args.mode, heavy_clients=heavy_clients))
